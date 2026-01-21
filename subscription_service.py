@@ -9,6 +9,7 @@ import hashlib
 import time
 import multiprocessing
 import uuid
+import redis
 from multiprocessing import Process, Queue
 from datetime import datetime, timezone
 from enum import Enum
@@ -24,10 +25,12 @@ class Config:
     STATE_FILE: str = "shared_state.json"
     PAGE_SIZE: int = 250
     CONCURRENT_PAGES: int = 2
-    RATE_LIMIT_RPM: int = 20
+    RATE_LIMIT_RPM: int = 20  # Per-service limit, shared across all workers via Redis
     RATE_LIMIT_BURST: int = 1
     FLUSH_BATCH_SIZE: int = 500
     NUM_WORKERS: int = 3
+    REDIS_HOST: str = "localhost"
+    REDIS_PORT: int = 6379
 
 
 config = Config()
@@ -78,31 +81,95 @@ def file_lock(filepath: str, mode: str = 'r+'):
         f.close()
 
 
-class TokenBucketRateLimiter:
-    """Token bucket rate limiter for controlling API request rates."""
+class RedisRateLimiter:
+    """
+    Redis-based token bucket rate limiter shared across all workers.
+    
+    Uses Redis to maintain token state, ensuring the rate limit is
+    respected globally across all workers polling the same service.
+    """
 
-    def __init__(self, rpm: int, burst: int):
-        self.rate = rpm / 60.0
+    def __init__(self, redis_client: redis.Redis, service_name: str, rpm: int, burst: int):
+        self.redis = redis_client
+        self.key = f"ratelimit:{service_name}"
+        self.rate = rpm / 60.0  # tokens per second
         self.capacity = burst
-        self.tokens = burst
-        self.last_update = time.monotonic()
         self.lock = asyncio.Lock()
 
     async def acquire(self):
-        """Wait until a token is available."""
-        async with self.lock:
-            while True:
-                now = time.monotonic()
-                elapsed = now - self.last_update
-                self.tokens = min(self.capacity, self.tokens + elapsed * self.rate)
-                self.last_update = now
+        """
+        Wait until a token is available (shared across all workers).
+        
+        Uses Redis to atomically check and update token count.
+        """
+        while True:
+            # Run Redis operations in thread pool to avoid blocking
+            acquired = await asyncio.get_event_loop().run_in_executor(
+                None, self._try_acquire
+            )
+            if acquired:
+                return
+            
+            # Wait before retrying
+            wait_time = 1.0 / self.rate if self.rate > 0 else 1.0
+            await asyncio.sleep(wait_time)
 
-                if self.tokens >= 1:
-                    self.tokens -= 1
-                    return
+    def _try_acquire(self) -> bool:
+        """
+        Atomically try to acquire a token from Redis.
+        
+        Uses a Lua script to ensure atomic read-modify-write.
+        """
+        lua_script = """
+        local key = KEYS[1]
+        local capacity = tonumber(ARGV[1])
+        local rate = tonumber(ARGV[2])
+        local now = tonumber(ARGV[3])
+        
+        -- Get current state
+        local state = redis.call('HMGET', key, 'tokens', 'last_update')
+        local tokens = tonumber(state[1]) or capacity
+        local last_update = tonumber(state[2]) or now
+        
+        -- Refill tokens based on elapsed time
+        local elapsed = now - last_update
+        tokens = math.min(capacity, tokens + elapsed * rate)
+        
+        -- Try to consume a token
+        if tokens >= 1 then
+            tokens = tokens - 1
+            redis.call('HMSET', key, 'tokens', tokens, 'last_update', now)
+            redis.call('EXPIRE', key, 120)  -- TTL to clean up stale keys
+            return 1
+        else
+            -- Update last_update even if no token consumed (for accurate refill)
+            redis.call('HMSET', key, 'tokens', tokens, 'last_update', now)
+            redis.call('EXPIRE', key, 120)
+            return 0
+        end
+        """
+        
+        now = time.time()
+        result = self.redis.eval(lua_script, 1, self.key, self.capacity, self.rate, now)
+        return result == 1
 
-                wait_time = (1 - self.tokens) / self.rate
-                await asyncio.sleep(wait_time)
+
+class RateLimiterFactory:
+    """Creates per-service rate limiters backed by Redis."""
+    
+    def __init__(self, redis_client: redis.Redis, rpm: int, burst: int):
+        self.redis = redis_client
+        self.rpm = rpm
+        self.burst = burst
+        self._limiters: Dict[str, RedisRateLimiter] = {}
+    
+    def get(self, service_name: str) -> RedisRateLimiter:
+        """Get or create a rate limiter for a specific service."""
+        if service_name not in self._limiters:
+            self._limiters[service_name] = RedisRateLimiter(
+                self.redis, service_name, self.rpm, self.burst
+            )
+        return self._limiters[service_name]
 
 
 class StateStore:
@@ -302,19 +369,22 @@ def run_flusher(data_queue: Queue, ack_queue: Queue, filepath: str, state_filepa
 class APIClient:
     """HTTP client for API interactions with retries, rate limiting, and pagination."""
 
-    def __init__(self, session: aiohttp.ClientSession, rate_limiter: TokenBucketRateLimiter):
+    def __init__(self, session: aiohttp.ClientSession, rate_limiter_factory: RateLimiterFactory):
         self.session = session
-        self.limiter = rate_limiter
+        self.limiter_factory = rate_limiter_factory
 
-    async def fetch_page(self, url: str, offset: int, cursor: Optional[str]) -> dict:
+    async def fetch_page(self, url: str, offset: int, cursor: Optional[str], service_name: str) -> dict:
         """Fetch a single page with automatic retries."""
         params = {'limit': config.PAGE_SIZE, 'offset': offset}
         if cursor:
             params['updatedSince'] = cursor
 
+        # Get per-service rate limiter
+        limiter = self.limiter_factory.get(service_name)
+
         for attempt in range(3):
             try:
-                await self.limiter.acquire()
+                await limiter.acquire()
 
                 async with self.session.get(url, params=params, timeout=30) as resp:
                     if resp.status == 429:
@@ -331,35 +401,45 @@ class APIClient:
 
         return {'items': [], 'total': 0}
 
-    async def fetch_all(self, url: str, cursor: Optional[str]) -> List[List[dict]]:
-        """Fetch all pages and return as list of batches."""
-        batches = []
+    async def fetch_stream(self, url: str, cursor: Optional[str], service_name: str):
+        """
+        Stream pages as they arrive (async generator).
         
-        first_page = await self.fetch_page(url, 0, cursor)
+        Yields (items, total, is_last) tuples for each page.
+        This allows the worker to send batches to the flusher immediately
+        rather than waiting for all pages to be fetched.
+        """
+        first_page = await self.fetch_page(url, 0, cursor, service_name)
         items = first_page.get('items', [])
         total = first_page.get('total', 0)
 
-        if items:
-            batches.append(items)
-
         if total <= config.PAGE_SIZE:
-            return batches
+            # Single page - yield it as the last one
+            if items:
+                yield items, total, True
+            return
 
-        logger.info(f"Fetching {total} items...")
+        # Multiple pages - yield first page
+        if items:
+            yield items, total, False
+
+        logger.info(f"Streaming {total} items...")
 
         offsets = list(range(config.PAGE_SIZE, total, config.PAGE_SIZE))
+        total_offsets = len(offsets)
 
-        for i in range(0, len(offsets), config.CONCURRENT_PAGES):
+        for i in range(0, total_offsets, config.CONCURRENT_PAGES):
             batch_offsets = offsets[i:i + config.CONCURRENT_PAGES]
-            tasks = [self.fetch_page(url, off, cursor) for off in batch_offsets]
+            tasks = [self.fetch_page(url, off, cursor, service_name) for off in batch_offsets]
 
             results = await asyncio.gather(*tasks)
-            for res in results:
+            
+            for j, res in enumerate(results):
                 batch_items = res.get('items', [])
+                # Check if this is the last batch
+                is_last = (i + j + 1) >= total_offsets
                 if batch_items:
-                    batches.append(batch_items)
-
-        return batches
+                    yield batch_items, total, is_last
 
 
 class Worker:
@@ -376,7 +456,13 @@ class Worker:
         self.ack_queue = ack_queue
         self.subscriptions = subscriptions
         self.state_store = StateStore(config.STATE_FILE)
-        self.rate_limiter = TokenBucketRateLimiter(rpm=config.RATE_LIMIT_RPM, burst=config.RATE_LIMIT_BURST)
+        # Redis-based rate limiting shared across all workers
+        self.redis_client = redis.Redis(host=config.REDIS_HOST, port=config.REDIS_PORT, decode_responses=True)
+        self.rate_limiter_factory = RateLimiterFactory(
+            self.redis_client, 
+            rpm=config.RATE_LIMIT_RPM, 
+            burst=config.RATE_LIMIT_BURST
+        )
         self.running = True
         self.pending_acks: Dict[str, bool] = {}  # batch_id -> received
 
@@ -407,7 +493,7 @@ class Worker:
         logger.info(f"Worker {self.worker_id} started")
 
         async with aiohttp.ClientSession() as session:
-            client = APIClient(session, self.rate_limiter)
+            client = APIClient(session, self.rate_limiter_factory)
 
             while self.running:
                 did_work = False
@@ -420,37 +506,38 @@ class Worker:
                         logger.info(f"[{self.worker_id}] Job acquired: {name}")
 
                         try:
-                            # Fetch all data first
-                            batches = await client.fetch_all(url, cursor)
-                            
-                            if not batches:
-                                # No data, release job immediately
-                                next_cursor = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-                                self.state_store.release_job(name, next_cursor)
-                                logger.info(f"[{self.worker_id}] Job completed: {name}. No new data.")
-                                continue
-
-                            # Create batch objects and send to flusher
                             next_cursor = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
                             batch_ids = []
-                            
-                            for i, items in enumerate(batches):
-                                is_final = (i == len(batches) - 1)
+                            total_items = 0
+                            batch_count = 0
+                            has_data = False
+
+                            # Stream pages and send to flusher immediately as they arrive
+                            async for items, total, is_last in client.fetch_stream(url, cursor, name):
+                                has_data = True
                                 batch = Batch(
                                     batch_id=str(uuid.uuid4()),
                                     job_name=name,
                                     items=items,
                                     cursor=next_cursor,
-                                    is_final=is_final
+                                    is_final=is_last
                                 )
                                 batch_ids.append(batch.batch_id)
                                 self.data_queue.put(batch)
+                                total_items += len(items)
+                                batch_count += 1
+                                logger.info(f"[{self.worker_id}] Sent batch {batch_count} ({len(items)} items) to flusher")
 
-                            total_items = sum(len(b) for b in batches)
-                            logger.info(f"[{self.worker_id}] Sent {total_items} items in {len(batches)} batches, waiting for ack...")
+                            if not has_data:
+                                # No data, release job immediately
+                                self.state_store.release_job(name, next_cursor)
+                                logger.info(f"[{self.worker_id}] Job completed: {name}. No new data.")
+                                continue
+
+                            logger.info(f"[{self.worker_id}] All {total_items} items sent in {batch_count} batches, waiting for acks...")
 
                             # Wait for ALL batches to be acknowledged (data persisted)
-                            acked = await self._wait_for_acks(batch_ids)
+                            acked = await self._wait_for_acks(batch_ids, timeout=120.0)
                             
                             if acked:
                                 logger.info(f"[{self.worker_id}] Job completed: {name}. All data persisted.")
