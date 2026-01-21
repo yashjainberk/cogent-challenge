@@ -7,10 +7,13 @@ import logging
 import signal
 import hashlib
 import time
+import multiprocessing
+import uuid
+from multiprocessing import Process, Queue
 from datetime import datetime, timezone
 from enum import Enum
-from dataclasses import dataclass
-from typing import Optional, List, Set, Tuple
+from dataclasses import dataclass, field
+from typing import Optional, List, Set, Tuple, Dict
 from contextlib import contextmanager
 
 
@@ -24,6 +27,7 @@ class Config:
     RATE_LIMIT_RPM: int = 20
     RATE_LIMIT_BURST: int = 1
     FLUSH_BATCH_SIZE: int = 500
+    NUM_WORKERS: int = 3
 
 
 config = Config()
@@ -34,6 +38,21 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 logger = logging.getLogger("SubscriptionService")
+
+
+@dataclass
+class Batch:
+    """
+    A batch of items from a single job fetch.
+    
+    The batch_id allows the flusher to acknowledge when this specific
+    batch has been persisted to disk.
+    """
+    batch_id: str
+    job_name: str
+    items: List[dict]
+    cursor: str  # The cursor to set after this batch is flushed
+    is_final: bool = False  # True if this is the last batch for this job
 
 
 class Interval(Enum):
@@ -141,13 +160,23 @@ class StateStore:
         os.fsync(f.fileno())
 
 
-class LogStore:
-    """Append-only log with in-memory deduplication."""
+class Flusher:
+    """
+    Single writer process that owns deduplication and disk writes.
+    
+    Sends acknowledgments back to workers after data is persisted,
+    ensuring at-least-once delivery semantics.
+    """
 
-    def __init__(self, filepath: str):
+    def __init__(self, data_queue: Queue, ack_queue: Queue, filepath: str, state_filepath: str):
+        self.data_queue = data_queue
+        self.ack_queue = ack_queue
         self.filepath = filepath
+        self.state_store = StateStore(state_filepath)
         self.seen_ids: Set[str] = set()
         self.buffer: List[dict] = []
+        self.pending_batches: List[Batch] = []  # Batches waiting to be flushed
+        self.running = True
         self._load_existing_ids()
 
     def _load_existing_ids(self):
@@ -169,37 +198,105 @@ class LogStore:
                             pass
         except Exception as e:
             logger.error(f"Error loading IDs: {e}")
-        logger.info(f"Loaded {count} existing IDs into memory")
+        logger.info(f"Flusher loaded {count} existing IDs into memory")
 
-    def add(self, items: List[dict]) -> int:
-        """Add items to buffer, filtering duplicates. Returns count of new items."""
-        added = 0
-        for item in items:
-            if 'id' not in item:
-                item['id'] = hashlib.md5(json.dumps(item, sort_keys=True).encode()).hexdigest()
-
-            if item['id'] not in self.seen_ids:
-                self.seen_ids.add(item['id'])
-                item['_ingested_at'] = datetime.now(timezone.utc).isoformat()
-                self.buffer.append(item)
-                added += 1
-
-        if len(self.buffer) >= config.FLUSH_BATCH_SIZE:
-            self.flush()
-        return added
-
-    def flush(self):
-        """Flush buffer to disk with file locking."""
+    def _flush_buffer(self):
+        """
+        Write buffer to disk, then update state and send acks.
+        
+        This is the critical section: data is written to disk BEFORE
+        we update the cursor in shared_state.json and send acks.
+        """
         if not self.buffer:
             return
 
-        with file_lock(self.filepath, 'a') as f:
+        # Step 1: Write data to disk
+        with open(self.filepath, 'a') as f:
             for item in self.buffer:
                 f.write(json.dumps(item) + '\n')
             f.flush()
             os.fsync(f.fileno())
 
+        logger.info(f"Flushed {len(self.buffer)} items to disk")
         self.buffer.clear()
+
+        # Step 2: Update cursors and send acks for completed batches
+        # Group final batches by job name to update cursor once per job
+        final_batches_by_job: Dict[str, Batch] = {}
+        for batch in self.pending_batches:
+            if batch.is_final:
+                final_batches_by_job[batch.job_name] = batch
+
+        # Update state for each completed job
+        for job_name, batch in final_batches_by_job.items():
+            self.state_store.release_job(job_name, batch.cursor)
+            logger.info(f"Released job {job_name} with cursor {batch.cursor}")
+
+        # Send acks for all pending batches
+        for batch in self.pending_batches:
+            self.ack_queue.put(batch.batch_id)
+
+        self.pending_batches.clear()
+
+    def run(self):
+        """
+        Main flusher loop.
+        
+        Receives Batch objects from workers, deduplicates items,
+        flushes to disk, then sends acknowledgments.
+        """
+        logger.info("Flusher process started")
+
+        while self.running:
+            try:
+                # Block for up to 1 second waiting for batches
+                batch = self.data_queue.get(timeout=1.0)
+
+                # Poison pill to stop the flusher
+                if batch is None:
+                    logger.info("Flusher received shutdown signal")
+                    self._flush_buffer()
+                    break
+
+                # Process batch items
+                for item in batch.items:
+                    item_id = item.get('id')
+                    if not item_id:
+                        item_id = hashlib.md5(json.dumps(item, sort_keys=True).encode()).hexdigest()
+                        item['id'] = item_id
+
+                    if item_id not in self.seen_ids:
+                        self.seen_ids.add(item_id)
+                        item['_ingested_at'] = datetime.now(timezone.utc).isoformat()
+                        self.buffer.append(item)
+
+                # Track this batch for acknowledgment
+                self.pending_batches.append(batch)
+
+                # Flush when buffer is full
+                if len(self.buffer) >= config.FLUSH_BATCH_SIZE:
+                    self._flush_buffer()
+
+            except Exception:
+                # Queue.get() timeout - flush any pending items
+                if self.buffer:
+                    self._flush_buffer()
+
+        logger.info("Flusher process stopped")
+
+    def stop(self):
+        self.running = False
+
+
+def run_flusher(data_queue: Queue, ack_queue: Queue, filepath: str, state_filepath: str):
+    """Entry point for the flusher process."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(levelname)s] [%(process)d] %(name)s: %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+    flusher = Flusher(data_queue, ack_queue, filepath, state_filepath)
+    flusher.run()
 
 
 class APIClient:
@@ -234,51 +331,80 @@ class APIClient:
 
         return {'items': [], 'total': 0}
 
-    async def fetch_stream(self, url: str, cursor: Optional[str]):
-        """Stream paginated data, yielding batches as they arrive."""
+    async def fetch_all(self, url: str, cursor: Optional[str]) -> List[List[dict]]:
+        """Fetch all pages and return as list of batches."""
+        batches = []
+        
         first_page = await self.fetch_page(url, 0, cursor)
         items = first_page.get('items', [])
         total = first_page.get('total', 0)
 
         if items:
-            yield items
+            batches.append(items)
 
         if total <= config.PAGE_SIZE:
-            return
+            return batches
 
-        logger.info(f"Streaming {total} items...")
+        logger.info(f"Fetching {total} items...")
 
         offsets = list(range(config.PAGE_SIZE, total, config.PAGE_SIZE))
 
         for i in range(0, len(offsets), config.CONCURRENT_PAGES):
-            batch = offsets[i:i + config.CONCURRENT_PAGES]
-            tasks = [self.fetch_page(url, off, cursor) for off in batch]
+            batch_offsets = offsets[i:i + config.CONCURRENT_PAGES]
+            tasks = [self.fetch_page(url, off, cursor) for off in batch_offsets]
 
             results = await asyncio.gather(*tasks)
             for res in results:
                 batch_items = res.get('items', [])
                 if batch_items:
-                    yield batch_items
+                    batches.append(batch_items)
+
+        return batches
 
 
-class SubscriptionService:
-    """Main service orchestrating API polling, deduplication, and persistence."""
+class Worker:
+    """
+    API polling worker that fetches data and sends batches to the flusher.
+    
+    Waits for acknowledgment from flusher before considering job complete.
+    This ensures data is persisted before the cursor advances.
+    """
 
-    def __init__(self):
-        self.worker_id = f"worker-{os.getpid()}"
+    def __init__(self, worker_id: str, data_queue: Queue, ack_queue: Queue, subscriptions: dict):
+        self.worker_id = worker_id
+        self.data_queue = data_queue
+        self.ack_queue = ack_queue
+        self.subscriptions = subscriptions
         self.state_store = StateStore(config.STATE_FILE)
-        self.log_store = LogStore(config.LOG_FILE)
         self.rate_limiter = TokenBucketRateLimiter(rpm=config.RATE_LIMIT_RPM, burst=config.RATE_LIMIT_BURST)
-        self.subscriptions = {}
         self.running = True
+        self.pending_acks: Dict[str, bool] = {}  # batch_id -> received
 
-    def register_api(self, name: str, url: str, interval: Interval, value: int = 1):
-        """Register an API endpoint for polling."""
-        self.subscriptions[name] = (url, interval.value * value)
+    def _check_acks(self):
+        """Non-blocking check for acknowledgments from flusher."""
+        while True:
+            try:
+                batch_id = self.ack_queue.get_nowait()
+                self.pending_acks[batch_id] = True
+            except:
+                break
+
+    async def _wait_for_acks(self, batch_ids: List[str], timeout: float = 60.0):
+        """Wait for all batch_ids to be acknowledged."""
+        start = time.monotonic()
+        while time.monotonic() - start < timeout:
+            self._check_acks()
+            if all(self.pending_acks.get(bid, False) for bid in batch_ids):
+                # Clean up
+                for bid in batch_ids:
+                    self.pending_acks.pop(bid, None)
+                return True
+            await asyncio.sleep(0.1)
+        return False
 
     async def run(self):
         """Main polling loop."""
-        logger.info(f"Starting {self.worker_id}")
+        logger.info(f"Worker {self.worker_id} started")
 
         async with aiohttp.ClientSession() as session:
             client = APIClient(session, self.rate_limiter)
@@ -291,31 +417,167 @@ class SubscriptionService:
 
                     if acquired:
                         did_work = True
-                        logger.info(f"Job acquired: {name}")
+                        logger.info(f"[{self.worker_id}] Job acquired: {name}")
 
                         try:
-                            total_ingested = 0
-                            async for batch in client.fetch_stream(url, cursor):
-                                added = self.log_store.add(batch)
-                                self.log_store.flush()
-                                total_ingested += added
+                            # Fetch all data first
+                            batches = await client.fetch_all(url, cursor)
+                            
+                            if not batches:
+                                # No data, release job immediately
+                                next_cursor = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
+                                self.state_store.release_job(name, next_cursor)
+                                logger.info(f"[{self.worker_id}] Job completed: {name}. No new data.")
+                                continue
 
+                            # Create batch objects and send to flusher
                             next_cursor = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-                            self.state_store.release_job(name, next_cursor)
+                            batch_ids = []
+                            
+                            for i, items in enumerate(batches):
+                                is_final = (i == len(batches) - 1)
+                                batch = Batch(
+                                    batch_id=str(uuid.uuid4()),
+                                    job_name=name,
+                                    items=items,
+                                    cursor=next_cursor,
+                                    is_final=is_final
+                                )
+                                batch_ids.append(batch.batch_id)
+                                self.data_queue.put(batch)
 
-                            logger.info(f"Job completed: {name}. Ingested: {total_ingested}")
+                            total_items = sum(len(b) for b in batches)
+                            logger.info(f"[{self.worker_id}] Sent {total_items} items in {len(batches)} batches, waiting for ack...")
+
+                            # Wait for ALL batches to be acknowledged (data persisted)
+                            acked = await self._wait_for_acks(batch_ids)
+                            
+                            if acked:
+                                logger.info(f"[{self.worker_id}] Job completed: {name}. All data persisted.")
+                            else:
+                                logger.error(f"[{self.worker_id}] Job {name} timed out waiting for acks!")
+
                         except Exception as e:
-                            logger.error(f"Job failed: {name}. Error: {e}")
+                            logger.error(f"[{self.worker_id}] Job failed: {name}. Error: {e}")
 
                 if not did_work:
                     await asyncio.sleep(1)
 
+        logger.info(f"Worker {self.worker_id} stopped")
+
     def stop(self):
-        """Signal the service to stop."""
         self.running = False
 
 
-async def main():
+def run_worker(worker_id: str, data_queue: Queue, ack_queue: Queue, subscriptions: dict):
+    """Entry point for a worker process."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format='%(asctime)s [%(levelname)s] [%(process)d] %(name)s: %(message)s',
+        datefmt='%Y-%m-%d %H:%M:%S'
+    )
+
+    worker = Worker(worker_id, data_queue, ack_queue, subscriptions)
+
+    def handle_sig(signum, frame):
+        logger.info(f"Worker {worker_id} received shutdown signal")
+        worker.stop()
+
+    signal.signal(signal.SIGINT, handle_sig)
+    signal.signal(signal.SIGTERM, handle_sig)
+
+    asyncio.run(worker.run())
+
+
+class SubscriptionService:
+    """
+    Main service orchestrating workers and the flusher.
+    
+    Architecture:
+    - N worker processes fetch from APIs and send Batch objects to data_queue
+    - 1 flusher process deduplicates, writes to disk, updates state, sends acks
+    - Workers wait for acks before considering jobs complete
+    
+    This ensures at-least-once delivery: data is ALWAYS on disk before
+    the cursor advances.
+    """
+
+    def __init__(self):
+        self.subscriptions = {}
+        self.data_queue: Queue = None
+        self.ack_queue: Queue = None
+        self.flusher_process: Process = None
+        self.worker_processes: List[Process] = []
+
+    def register_api(self, name: str, url: str, interval: Interval, value: int = 1):
+        """Register an API endpoint for polling."""
+        self.subscriptions[name] = (url, interval.value * value)
+
+    def start(self):
+        """Start the flusher and worker processes."""
+        # Create shared queues
+        self.data_queue = multiprocessing.Queue()
+        self.ack_queue = multiprocessing.Queue()
+
+        # Start flusher process (single writer)
+        self.flusher_process = Process(
+            target=run_flusher,
+            args=(self.data_queue, self.ack_queue, config.LOG_FILE, config.STATE_FILE),
+            name="flusher"
+        )
+        self.flusher_process.start()
+        logger.info(f"Started flusher process (PID: {self.flusher_process.pid})")
+
+        # Start worker processes
+        for i in range(config.NUM_WORKERS):
+            worker_id = f"worker-{i}"
+            p = Process(
+                target=run_worker,
+                args=(worker_id, self.data_queue, self.ack_queue, self.subscriptions),
+                name=worker_id
+            )
+            p.start()
+            self.worker_processes.append(p)
+            logger.info(f"Started {worker_id} (PID: {p.pid})")
+
+    def stop(self):
+        """Gracefully stop all processes."""
+        logger.info("Stopping all workers...")
+
+        # Stop workers first
+        for p in self.worker_processes:
+            if p.is_alive():
+                p.terminate()
+                p.join(timeout=5)
+
+        # Send poison pill to flusher to trigger final flush
+        if self.data_queue:
+            self.data_queue.put(None)
+
+        # Wait for flusher to finish
+        if self.flusher_process and self.flusher_process.is_alive():
+            self.flusher_process.join(timeout=10)
+
+        logger.info("All processes stopped")
+
+    def wait(self):
+        """Wait for all processes to complete."""
+        try:
+            while True:
+                for p in self.worker_processes:
+                    if not p.is_alive():
+                        logger.warning(f"Worker {p.name} died unexpectedly")
+
+                if not self.flusher_process.is_alive():
+                    logger.error("Flusher died unexpectedly!")
+                    break
+
+                time.sleep(1)
+        except KeyboardInterrupt:
+            pass
+
+
+def main():
     """Entry point with graceful shutdown handling."""
     service = SubscriptionService()
 
@@ -323,21 +585,16 @@ async def main():
     service.register_api("rapid7", "https://api.cogent.security/sandbox/rapid7/vulnerabilities", Interval.HOUR, 4)
     service.register_api("tenable", "https://api.cogent.security/sandbox/tenable/vulnerabilities", Interval.HOUR, 4)
 
-    loop = asyncio.get_running_loop()
-    stop_event = asyncio.Event()
-
-    def handle_sig():
+    def handle_shutdown(signum, frame):
         logger.info("Shutdown signal received")
         service.stop()
-        stop_event.set()
 
-    loop.add_signal_handler(signal.SIGINT, handle_sig)
-    loop.add_signal_handler(signal.SIGTERM, handle_sig)
+    signal.signal(signal.SIGINT, handle_shutdown)
+    signal.signal(signal.SIGTERM, handle_shutdown)
 
-    task = asyncio.create_task(service.run())
-    await stop_event.wait()
-    await task
+    service.start()
+    service.wait()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    main()
