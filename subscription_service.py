@@ -8,12 +8,11 @@ import signal
 import hashlib
 import time
 import multiprocessing
-import uuid
 import redis
 from multiprocessing import Process, Queue
 from datetime import datetime, timezone
 from enum import Enum
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional, List, Set, Tuple, Dict
 from contextlib import contextmanager
 
@@ -48,10 +47,8 @@ class Batch:
     """
     A batch of items from a single job fetch.
     
-    The batch_id allows the flusher to acknowledge when this specific
-    batch has been persisted to disk.
+    The flusher uses is_final to know when to update the cursor in shared_state.
     """
-    batch_id: str
     job_name: str
     items: List[dict]
     cursor: str  # The cursor to set after this batch is flushed
@@ -229,15 +226,18 @@ class StateStore:
 
 class Flusher:
     """
-    Single writer process that owns deduplication and disk writes.
+    Single writer process that owns deduplication, disk writes, and job completion.
     
-    Sends acknowledgments back to workers after data is persisted,
-    ensuring at-least-once delivery semantics.
+    The flusher is the single source of truth for:
+    - Deduplication (in-memory seen_ids set)
+    - Disk writes (append-only log with fsync)
+    - Job state (updates shared_state.json after data is persisted)
+    
+    This ensures crash safety: cursor only advances AFTER data is on disk.
     """
 
-    def __init__(self, data_queue: Queue, ack_queue: Queue, filepath: str, state_filepath: str):
+    def __init__(self, data_queue: Queue, filepath: str, state_filepath: str):
         self.data_queue = data_queue
-        self.ack_queue = ack_queue
         self.filepath = filepath
         self.state_store = StateStore(state_filepath)
         self.seen_ids: Set[str] = set()
@@ -269,10 +269,14 @@ class Flusher:
 
     def _flush_buffer(self):
         """
-        Write buffer to disk, then update state and send acks.
+        Write buffer to disk, then update job state.
         
-        This is the critical section: data is written to disk BEFORE
-        we update the cursor in shared_state.json and send acks.
+        Critical ordering:
+        1. Write data to disk
+        2. fsync to ensure durability
+        3. Update cursor in shared_state.json
+        
+        If crash occurs before step 3, data may be re-fetched (at-least-once).
         """
         if not self.buffer:
             return
@@ -287,21 +291,15 @@ class Flusher:
         logger.info(f"Flushed {len(self.buffer)} items to disk")
         self.buffer.clear()
 
-        # Step 2: Update cursors and send acks for completed batches
-        # Group final batches by job name to update cursor once per job
+        # Step 2: Update cursors for completed jobs
         final_batches_by_job: Dict[str, Batch] = {}
         for batch in self.pending_batches:
             if batch.is_final:
                 final_batches_by_job[batch.job_name] = batch
 
-        # Update state for each completed job
         for job_name, batch in final_batches_by_job.items():
             self.state_store.release_job(job_name, batch.cursor)
-            logger.info(f"Released job {job_name} with cursor {batch.cursor}")
-
-        # Send acks for all pending batches
-        for batch in self.pending_batches:
-            self.ack_queue.put(batch.batch_id)
+            logger.info(f"Job {job_name} completed, cursor updated to {batch.cursor}")
 
         self.pending_batches.clear()
 
@@ -310,7 +308,7 @@ class Flusher:
         Main flusher loop.
         
         Receives Batch objects from workers, deduplicates items,
-        flushes to disk, then sends acknowledgments.
+        flushes to disk, and updates job cursors.
         """
         logger.info("Flusher process started")
 
@@ -355,14 +353,14 @@ class Flusher:
         self.running = False
 
 
-def run_flusher(data_queue: Queue, ack_queue: Queue, filepath: str, state_filepath: str):
+def run_flusher(data_queue: Queue, filepath: str, state_filepath: str):
     """Entry point for the flusher process."""
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s [%(levelname)s] [%(process)d] %(name)s: %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
     )
-    flusher = Flusher(data_queue, ack_queue, filepath, state_filepath)
+    flusher = Flusher(data_queue, filepath, state_filepath)
     flusher.run()
 
 
@@ -446,14 +444,14 @@ class Worker:
     """
     API polling worker that fetches data and sends batches to the flusher.
     
-    Waits for acknowledgment from flusher before considering job complete.
-    This ensures data is persisted before the cursor advances.
+    Workers are stateless fetchers - they don't track job completion.
+    The flusher owns the job lifecycle and updates shared_state.json
+    after data is persisted to disk.
     """
 
-    def __init__(self, worker_id: str, data_queue: Queue, ack_queue: Queue, subscriptions: dict):
+    def __init__(self, worker_id: str, data_queue: Queue, subscriptions: dict):
         self.worker_id = worker_id
         self.data_queue = data_queue
-        self.ack_queue = ack_queue
         self.subscriptions = subscriptions
         self.state_store = StateStore(config.STATE_FILE)
         # Redis-based rate limiting shared across all workers
@@ -464,29 +462,6 @@ class Worker:
             burst=config.RATE_LIMIT_BURST
         )
         self.running = True
-        self.pending_acks: Dict[str, bool] = {}  # batch_id -> received
-
-    def _check_acks(self):
-        """Non-blocking check for acknowledgments from flusher."""
-        while True:
-            try:
-                batch_id = self.ack_queue.get_nowait()
-                self.pending_acks[batch_id] = True
-            except:
-                break
-
-    async def _wait_for_acks(self, batch_ids: List[str], timeout: float = 60.0):
-        """Wait for all batch_ids to be acknowledged."""
-        start = time.monotonic()
-        while time.monotonic() - start < timeout:
-            self._check_acks()
-            if all(self.pending_acks.get(bid, False) for bid in batch_ids):
-                # Clean up
-                for bid in batch_ids:
-                    self.pending_acks.pop(bid, None)
-                return True
-            await asyncio.sleep(0.1)
-        return False
 
     async def run(self):
         """Main polling loop."""
@@ -507,7 +482,6 @@ class Worker:
 
                         try:
                             next_cursor = datetime.now(timezone.utc).strftime('%Y-%m-%dT%H:%M:%SZ')
-                            batch_ids = []
                             total_items = 0
                             batch_count = 0
                             has_data = False
@@ -516,33 +490,24 @@ class Worker:
                             async for items, total, is_last in client.fetch_stream(url, cursor, name):
                                 has_data = True
                                 batch = Batch(
-                                    batch_id=str(uuid.uuid4()),
                                     job_name=name,
                                     items=items,
                                     cursor=next_cursor,
                                     is_final=is_last
                                 )
-                                batch_ids.append(batch.batch_id)
                                 self.data_queue.put(batch)
                                 total_items += len(items)
                                 batch_count += 1
                                 logger.info(f"[{self.worker_id}] Sent batch {batch_count} ({len(items)} items) to flusher")
 
                             if not has_data:
-                                # No data, release job immediately
+                                # No data, release job immediately (flusher won't see this job)
                                 self.state_store.release_job(name, next_cursor)
                                 logger.info(f"[{self.worker_id}] Job completed: {name}. No new data.")
                                 continue
 
-                            logger.info(f"[{self.worker_id}] All {total_items} items sent in {batch_count} batches, waiting for acks...")
-
-                            # Wait for ALL batches to be acknowledged (data persisted)
-                            acked = await self._wait_for_acks(batch_ids, timeout=120.0)
-                            
-                            if acked:
-                                logger.info(f"[{self.worker_id}] Job completed: {name}. All data persisted.")
-                            else:
-                                logger.error(f"[{self.worker_id}] Job {name} timed out waiting for acks!")
+                            # Flusher will update shared_state.json after persisting data
+                            logger.info(f"[{self.worker_id}] Sent all {total_items} items in {batch_count} batches to flusher")
 
                         except Exception as e:
                             logger.error(f"[{self.worker_id}] Job failed: {name}. Error: {e}")
@@ -556,7 +521,7 @@ class Worker:
         self.running = False
 
 
-def run_worker(worker_id: str, data_queue: Queue, ack_queue: Queue, subscriptions: dict):
+def run_worker(worker_id: str, data_queue: Queue, subscriptions: dict):
     """Entry point for a worker process."""
     logging.basicConfig(
         level=logging.INFO,
@@ -564,7 +529,7 @@ def run_worker(worker_id: str, data_queue: Queue, ack_queue: Queue, subscription
         datefmt='%Y-%m-%d %H:%M:%S'
     )
 
-    worker = Worker(worker_id, data_queue, ack_queue, subscriptions)
+    worker = Worker(worker_id, data_queue, subscriptions)
 
     def handle_sig(signum, frame):
         logger.info(f"Worker {worker_id} received shutdown signal")
@@ -582,17 +547,15 @@ class SubscriptionService:
     
     Architecture:
     - N worker processes fetch from APIs and send Batch objects to data_queue
-    - 1 flusher process deduplicates, writes to disk, updates state, sends acks
-    - Workers wait for acks before considering jobs complete
+    - 1 flusher process deduplicates, writes to disk, and updates job cursors
     
-    This ensures at-least-once delivery: data is ALWAYS on disk before
-    the cursor advances.
+    The flusher owns the job lifecycle - it updates shared_state.json AFTER
+    data is persisted to disk, ensuring at-least-once delivery.
     """
 
     def __init__(self):
         self.subscriptions = {}
         self.data_queue: Queue = None
-        self.ack_queue: Queue = None
         self.flusher_process: Process = None
         self.worker_processes: List[Process] = []
 
@@ -602,14 +565,13 @@ class SubscriptionService:
 
     def start(self):
         """Start the flusher and worker processes."""
-        # Create shared queues
+        # Create shared queue (no ack queue needed - flusher owns job completion)
         self.data_queue = multiprocessing.Queue()
-        self.ack_queue = multiprocessing.Queue()
 
-        # Start flusher process (single writer)
+        # Start flusher process (single writer, owns job state)
         self.flusher_process = Process(
             target=run_flusher,
-            args=(self.data_queue, self.ack_queue, config.LOG_FILE, config.STATE_FILE),
+            args=(self.data_queue, config.LOG_FILE, config.STATE_FILE),
             name="flusher"
         )
         self.flusher_process.start()
@@ -620,7 +582,7 @@ class SubscriptionService:
             worker_id = f"worker-{i}"
             p = Process(
                 target=run_worker,
-                args=(worker_id, self.data_queue, self.ack_queue, self.subscriptions),
+                args=(worker_id, self.data_queue, self.subscriptions),
                 name=worker_id
             )
             p.start()
