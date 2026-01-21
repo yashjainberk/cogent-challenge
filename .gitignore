@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.env
+.DS_Store
+# Data and State
+vulnerabilities.jsonl
+shared_state.json
+test_vulnerabilities.jsonl
+test_shared_state.json
+*.log
