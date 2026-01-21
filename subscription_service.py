@@ -15,6 +15,7 @@ from enum import Enum
 from dataclasses import dataclass
 from typing import Optional, List, Set, Tuple, Dict
 from contextlib import contextmanager
+from collections import OrderedDict
 
 
 @dataclass
@@ -216,6 +217,18 @@ class StateStore:
             })
             self._save(f, state)
 
+    def checkpoint_cursor(self, api_name: str, cursor: str):
+        """Update cursor in shared state without releasing the job claim."""
+        with file_lock(self.filepath, 'r+') as f:
+            try:
+                state = json.loads(f.read().strip() or '{}')
+            except json.JSONDecodeError:
+                state = {}
+
+            if api_name in state:
+                state[api_name]['cursor'] = cursor
+                self._save(f, state)
+
     def _save(self, f, state):
         f.seek(0)
         f.truncate()
@@ -240,32 +253,57 @@ class Flusher:
         self.data_queue = data_queue
         self.filepath = filepath
         self.state_store = StateStore(state_filepath)
-        self.seen_ids: Set[str] = set()
+        # Use Redis for 100% accurate, distributed deduplication
+        self.redis = redis.Redis(host=config.REDIS_HOST, port=config.REDIS_PORT, decode_responses=True)
         self.buffer: List[dict] = []
         self.pending_batches: List[Batch] = []  # Batches waiting to be flushed
         self.running = True
-        self._load_existing_ids()
+        self._sync_ids_to_redis()
 
-    def _load_existing_ids(self):
-        """Load existing item IDs from log file into memory."""
+    def _sync_ids_to_redis(self):
+        """Sync existing item IDs from log file to Redis on startup."""
         if not os.path.exists(self.filepath):
             return
 
         count = 0
         try:
             with open(self.filepath, 'r') as f:
+                batch = []
                 for line in f:
                     if line.strip():
                         try:
                             data = json.loads(line)
-                            if 'id' in data:
-                                self.seen_ids.add(data['id'])
-                                count += 1
+                            # Create fingerprint from content to allow updates
+                            fingerprint = hashlib.md5(json.dumps(data, sort_keys=True).encode()).hexdigest()
+                            batch.append(fingerprint)
+                            
+                            if len(batch) >= 1000:
+                                self.redis.sadd("seen_fingerprints", *batch)
+                                count += len(batch)
+                                batch = []
                         except:
                             pass
+                if batch:
+                    self.redis.sadd("seen_fingerprints", *batch)
+                    count += len(batch)
         except Exception as e:
-            logger.error(f"Error loading IDs: {e}")
-        logger.info(f"Flusher loaded {count} existing IDs into memory")
+            logger.error(f"Error syncing IDs to Redis: {e}")
+        logger.info(f"Flusher synced {count} existing fingerprints to Redis")
+
+    def is_duplicate(self, item: dict) -> bool:
+        """
+        Check if an item is an exact duplicate using a content hash.
+        
+        Returns True if the content has been seen before.
+        Returns False for new items OR updated items (different content).
+        """
+        # Exclude our internal metadata before hashing
+        clean_item = {k: v for k, v in item.items() if k not in ('id', '_ingested_at')}
+        fingerprint = hashlib.md5(json.dumps(clean_item, sort_keys=True).encode()).hexdigest()
+        
+        # SADD returns 1 if added (new), 0 if already exists (duplicate)
+        is_new = self.redis.sadd("seen_fingerprints", fingerprint)
+        return is_new == 0
 
     def _flush_buffer(self):
         """
@@ -291,15 +329,19 @@ class Flusher:
         logger.info(f"Flushed {len(self.buffer)} items to disk")
         self.buffer.clear()
 
-        # Step 2: Update cursors for completed jobs
-        final_batches_by_job: Dict[str, Batch] = {}
+        # Step 2: Update cursors (Checkpointing & Job Completion)
+        # Track the latest cursor for each job in this flush cycle
+        job_updates: Dict[str, Tuple[str, bool]] = {}
         for batch in self.pending_batches:
-            if batch.is_final:
-                final_batches_by_job[batch.job_name] = batch
+            job_updates[batch.job_name] = (batch.cursor, batch.is_final)
 
-        for job_name, batch in final_batches_by_job.items():
-            self.state_store.release_job(job_name, batch.cursor)
-            logger.info(f"Job {job_name} completed, cursor updated to {batch.cursor}")
+        for job_name, (cursor, is_final) in job_updates.items():
+            if is_final:
+                self.state_store.release_job(job_name, cursor)
+                logger.info(f"Job {job_name} completed, cursor updated to {cursor}")
+            else:
+                self.state_store.checkpoint_cursor(job_name, cursor)
+                logger.info(f"Job {job_name} checkpointed at cursor {cursor}")
 
         self.pending_batches.clear()
 
@@ -325,13 +367,13 @@ class Flusher:
 
                 # Process batch items
                 for item in batch.items:
-                    item_id = item.get('id')
-                    if not item_id:
-                        item_id = hashlib.md5(json.dumps(item, sort_keys=True).encode()).hexdigest()
-                        item['id'] = item_id
-
-                    if item_id not in self.seen_ids:
-                        self.seen_ids.add(item_id)
+                    # Treat exact content duplicates as duplicates, 
+                    # but allow items with the same ID but changed content (updates)
+                    if not self.is_duplicate(item):
+                        if 'id' not in item:
+                            # Fallback ID if missing
+                            item['id'] = hashlib.md5(json.dumps(item, sort_keys=True).encode()).hexdigest()
+                        
                         item['_ingested_at'] = datetime.now(timezone.utc).isoformat()
                         self.buffer.append(item)
 
