@@ -9,7 +9,8 @@ import hashlib
 import time
 import multiprocessing
 import redis
-from multiprocessing import Process, Queue
+import pickle
+from multiprocessing import Process
 from datetime import datetime, timezone
 from enum import Enum
 from dataclasses import dataclass
@@ -77,6 +78,30 @@ def file_lock(filepath: str, mode: str = 'r+'):
     finally:
         fcntl.flock(f.fileno(), fcntl.LOCK_UN)
         f.close()
+
+
+class RedisQueue:
+    """A distributed queue backed by Redis."""
+    def __init__(self, redis_client: redis.Redis, name: str = "flush_queue"):
+        self.redis = redis_client
+        self.name = name
+
+    def put(self, obj):
+        """Put an object into the queue (RPUSH)."""
+        # We use pickle to handle complex objects like Batch
+        self.redis.rpush(self.name, pickle.dumps(obj))
+
+    def get(self, timeout=None):
+        """Get an object from the queue (BLPOP)."""
+        # timeout in BLPOP is in seconds
+        res = self.redis.blpop(self.name, timeout=int(timeout or 0))
+        if res:
+            return pickle.loads(res[1])
+        return None
+
+    def clear(self):
+        """Clear the queue."""
+        self.redis.delete(self.name)
 
 
 class RedisRateLimiter:
@@ -249,7 +274,7 @@ class Flusher:
     This ensures crash safety: cursor only advances AFTER data is on disk.
     """
 
-    def __init__(self, data_queue: Queue, filepath: str, state_filepath: str):
+    def __init__(self, data_queue: 'RedisQueue', filepath: str, state_filepath: str):
         self.data_queue = data_queue
         self.filepath = filepath
         self.state_store = StateStore(state_filepath)
@@ -395,13 +420,16 @@ class Flusher:
         self.running = False
 
 
-def run_flusher(data_queue: Queue, filepath: str, state_filepath: str):
+def run_flusher(filepath: str, state_filepath: str):
     """Entry point for the flusher process."""
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s [%(levelname)s] [%(process)d] %(name)s: %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
     )
+    # Initialize Redis connection inside the process
+    redis_client = redis.Redis(host=config.REDIS_HOST, port=config.REDIS_PORT, decode_responses=False)
+    data_queue = RedisQueue(redis_client)
     flusher = Flusher(data_queue, filepath, state_filepath)
     flusher.run()
 
@@ -491,13 +519,15 @@ class Worker:
     after data is persisted to disk.
     """
 
-    def __init__(self, worker_id: str, data_queue: Queue, subscriptions: dict):
+    def __init__(self, worker_id: str, subscriptions: dict):
         self.worker_id = worker_id
-        self.data_queue = data_queue
         self.subscriptions = subscriptions
         self.state_store = StateStore(config.STATE_FILE)
         # Redis-based rate limiting shared across all workers
         self.redis_client = redis.Redis(host=config.REDIS_HOST, port=config.REDIS_PORT, decode_responses=True)
+        # Separate client for binary queue operations
+        self.redis_binary = redis.Redis(host=config.REDIS_HOST, port=config.REDIS_PORT, decode_responses=False)
+        self.data_queue = RedisQueue(self.redis_binary)
         self.rate_limiter_factory = RateLimiterFactory(
             self.redis_client, 
             rpm=config.RATE_LIMIT_RPM, 
@@ -563,7 +593,7 @@ class Worker:
         self.running = False
 
 
-def run_worker(worker_id: str, data_queue: Queue, subscriptions: dict):
+def run_worker(worker_id: str, subscriptions: dict):
     """Entry point for a worker process."""
     logging.basicConfig(
         level=logging.INFO,
@@ -571,7 +601,7 @@ def run_worker(worker_id: str, data_queue: Queue, subscriptions: dict):
         datefmt='%Y-%m-%d %H:%M:%S'
     )
 
-    worker = Worker(worker_id, data_queue, subscriptions)
+    worker = Worker(worker_id, subscriptions)
 
     def handle_sig(signum, frame):
         logger.info(f"Worker {worker_id} received shutdown signal")
@@ -597,9 +627,11 @@ class SubscriptionService:
 
     def __init__(self):
         self.subscriptions = {}
-        self.data_queue: Queue = None
         self.flusher_process: Process = None
         self.worker_processes: List[Process] = []
+        # Shared Redis connection for queue cleanup
+        self.redis = redis.Redis(host=config.REDIS_HOST, port=config.REDIS_PORT)
+        self.data_queue = RedisQueue(self.redis)
 
     def register_api(self, name: str, url: str, interval: Interval, value: int = 1):
         """Register an API endpoint for polling."""
@@ -607,13 +639,13 @@ class SubscriptionService:
 
     def start(self):
         """Start the flusher and worker processes."""
-        # Create shared queue (no ack queue needed - flusher owns job completion)
-        self.data_queue = multiprocessing.Queue()
+        # Clear shared queue from previous runs
+        self.data_queue.clear()
 
         # Start flusher process (single writer, owns job state)
         self.flusher_process = Process(
             target=run_flusher,
-            args=(self.data_queue, config.LOG_FILE, config.STATE_FILE),
+            args=(config.LOG_FILE, config.STATE_FILE),
             name="flusher"
         )
         self.flusher_process.start()
@@ -624,7 +656,7 @@ class SubscriptionService:
             worker_id = f"worker-{i}"
             p = Process(
                 target=run_worker,
-                args=(worker_id, self.data_queue, self.subscriptions),
+                args=(worker_id, self.subscriptions),
                 name=worker_id
             )
             p.start()

@@ -4,20 +4,19 @@ A horizontally scalable polling service for ingesting vulnerability data from mu
 
 ## Features
 
--   **Scalable Architecture**: Multiple worker processes fetch from APIs in parallel, with a single flusher process handling deduplication and disk writes.
--   **Distributed Coordination**: File-based job locking ensures each API is polled by only one worker at a time.
--   **Redis-Based Rate Limiting**: Per-service rate limits shared across all workers to respect API quotas (20 RPM per service).
--   **Streaming Ingestion**: Pages are sent to the flusher immediately as they arrive, rather than waiting for all pages to be fetched.
--   **Acknowledgment-Based Persistence**: Workers wait for the flusher to confirm data is written to disk before updating cursors, ensuring crash safety.
--   **Data Integrity**:
-    -   In-memory O(1) deduplication in the flusher process.
-    -   Append-only JSON Lines log with fsync for durability.
-    -   Crash-recovery support (resumes from last successful cursor).
+-   **Scalable Distributed Architecture**: Workers and flushers communicate via a shared Redis Queue, allowing for multi-machine scaling.
+-   **Distributed Job Coordination**: File-based locking (fcntl) ensures APIs are polled reliably without overlap.
+-   **Redis-Based Rate Limiting**: Per-service token-bucket rate limits shared across all workers (global 20 RPM per service).
+-   **100% Accurate Deduplication**: Redis-backed content fingerprinting prevents duplicates even for updated items and across restarts.
+-   **Checkpointing & Crash Safety**: Intermediate cursors are saved to `shared_state.json` after every disk flush, allowing long-running jobs to resume without data loss.
+-   **Data Durability**: 
+    -   Append-only JSON Lines log with `fsync` on every batch flush.
+    -   Atomic state updates ensure cursor only advances after data is physically on disk.
 
 ## Prerequisites
 
 -   Python 3.11+
--   Redis server running locally
+-   Redis server (used for Queue, Deduplication, and Rate Limiting)
 
 ### Start Redis
 
@@ -39,24 +38,33 @@ Run the service (spawns 3 workers + 1 flusher by default):
 python subscription_service.py
 ```
 
+Run the test suite:
+
+```bash
+pytest test_subscription_service.py
+```
+
 ## Architecture
 
-```
+The system uses a distributed producer-consumer model coordinated by Redis.
+
+```text
 ┌──────────────┐
 │   Worker 0   │──┐
-│ (qualys)     │  │
-└──────────────┘  │
-┌──────────────┐  │     ┌────────────────┐      ┌─────────────┐
-│   Worker 1   │──┼────▶│  Shared Queue  │─────▶│   Flusher   │───▶ vulnerabilities.jsonl
-│ (rapid7)     │  │     │ (mp.Queue)     │      │ (seen_ids)  │
-└──────────────┘  │     └────────────────┘      └─────────────┘
-┌──────────────┐  │
-│   Worker 2   │──┘
-│ (tenable)    │
-└──────────────┘
-       │
-       ▼
-   Redis (shared rate limiting per service)
+│ (qualys)     │  │      ┌──────────────────┐
+└──────────────┘  │      │   Redis Queue    │      ┌─────────────┐
+┌──────────────┐  │      │ (RPUSH / BLPOP)  │      │   Flusher   │──▶ vulnerabilities.jsonl
+│   Worker 1   │──┼─────▶│  [Shared Job]    │─────▶│ (Single)    │──▶ shared_state.json (Checkpoint)
+│ (rapid7)     │  │      └──────────────────┘      └─────────────┘
+└──────────────┘  │               ▲                       │
+┌──────────────┐  │               │                       │
+│   Worker 2   │──┘               │                       │
+│ (tenable)    │                  │                       │
+└──────────────┘                  ▼                       ▼
+       │                 ┌──────────────────┐    ┌──────────────────┐
+       └────────────────▶│      Redis       │◀───┤   Redis Set      │
+                         │ (Rate Limiting)  │    │ (Deduplication)  │
+                         └──────────────────┘    └──────────────────┘
 ```
 
 ## Configuration
@@ -70,3 +78,13 @@ Edit the `Config` class in `subscription_service.py`:
 | `FLUSH_BATCH_SIZE` | 500 | Items buffered before flushing to disk |
 | `REDIS_HOST` | localhost | Redis server hostname |
 | `REDIS_PORT` | 6379 | Redis server port |
+| `LOG_FILE` | vulnerabilities.jsonl | Path to the append-only data log |
+| `STATE_FILE` | shared_state.json | Path to the job cursor state file |
+
+## Testing
+
+The project includes a comprehensive test suite covering:
+-   **API Client**: Pagination, retries, and streaming logic.
+-   **Deduplication**: Content-based hashing and Redis integration.
+-   **Rate Limiting**: Distributed token bucket verification.
+-   **Durability**: Checkpointing, crash recovery, and atomic state updates.

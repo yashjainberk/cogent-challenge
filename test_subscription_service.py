@@ -110,7 +110,6 @@ class TestFlusher:
 
     def test_deduplication(self, temp_files):
         log_path, state_path = temp_files
-        from multiprocessing import Queue
         
         # Mock Redis
         with patch('redis.Redis') as mock_redis_cls:
@@ -118,8 +117,8 @@ class TestFlusher:
             # SADD returns 1 for new, 0 for existing
             mock_redis.sadd.side_effect = [1, 0, 1] 
 
-            queue = Queue()
-            flusher = Flusher(queue, log_path, state_path)
+            data_queue = Mock()
+            flusher = Flusher(data_queue, log_path, state_path)
 
             items = [
                 {"id": "item-1", "data": "first"},
@@ -139,17 +138,15 @@ class TestFlusher:
 
     def test_flush_buffer_durability(self, temp_files):
         log_path, state_path = temp_files
-        from multiprocessing import Queue
 
-        queue = Queue()
-        flusher = Flusher(queue, log_path, state_path)
+        data_queue = Mock()
+        flusher = Flusher(data_queue, log_path, state_path)
 
         # Add items to buffer
         flusher.buffer = [
             {"id": "item-1", "data": "test1"},
             {"id": "item-2", "data": "test2"}
         ]
-        flusher.seen_ids = {"item-1", "item-2"}
 
         # Flush
         flusher._flush_buffer()
@@ -173,17 +170,15 @@ class TestFlusher:
         # Mock Redis
         with patch('redis.Redis') as mock_redis_cls:
             mock_redis = mock_redis_cls.return_value
-            from multiprocessing import Queue
-            queue = Queue()
-            flusher = Flusher(queue, log_path, state_path)
+            data_queue = Mock()
+            flusher = Flusher(data_queue, log_path, state_path)
 
             # Sync should have been called twice
             assert mock_redis.sadd.called
 
     def test_batch_processing_with_final_flag(self, temp_files):
         log_path, state_path = temp_files
-        from multiprocessing import Queue
-
+    
         # Initialize state with the job before testing
         with open(state_path, 'w') as f:
             json.dump({"test_job": {"cursor": None, "claimed_by": "worker-1", "claimed_at": 123456}}, f)
@@ -193,8 +188,8 @@ class TestFlusher:
             mock_redis = mock_redis_cls.return_value
             mock_redis.sadd.return_value = 1  # All items new
 
-            queue = Queue()
-            flusher = Flusher(queue, log_path, state_path)
+            data_queue = Mock()
+            flusher = Flusher(data_queue, log_path, state_path)
 
             # Process batch
             batch = Batch(
@@ -419,7 +414,6 @@ class TestIntegration:
     def test_crash_recovery(self, temp_files):
         """Test that service can recover after crash."""
         log_path, state_path = temp_files
-        from multiprocessing import Queue
     
         # Simulate partial write before crash
         with open(log_path, 'w') as f:
@@ -439,8 +433,8 @@ class TestIntegration:
         # Start flusher (recovery)
         with patch('redis.Redis') as mock_redis_cls:
             mock_redis = mock_redis_cls.return_value
-            queue = Queue()
-            flusher = Flusher(queue, log_path, state_path)
+            data_queue = Mock()
+            flusher = Flusher(data_queue, log_path, state_path)
     
             # Sync should have called sadd for the pre-crash item
             assert mock_redis.sadd.called
@@ -497,7 +491,6 @@ class TestPerformance:
     def test_checkpointing(self, temp_files):
         """Test that cursors are checkpointed before job completion."""
         log_path, state_path = temp_files
-        from multiprocessing import Queue
         
         # Initialize state
         with open(state_path, 'w') as f:
@@ -508,8 +501,8 @@ class TestPerformance:
             mock_redis = mock_redis_cls.return_value
             mock_redis.sadd.return_value = 1
 
-            queue = Queue()
-            flusher = Flusher(queue, log_path, state_path)
+            data_queue = Mock()
+            flusher = Flusher(data_queue, log_path, state_path)
 
             # Process an intermediate batch (is_final=False)
             batch = Batch(job_name="test_job", items=[{"id": "1"}], cursor="mid-point", is_final=False)
