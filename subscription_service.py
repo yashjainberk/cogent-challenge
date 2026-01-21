@@ -1,28 +1,3 @@
-"""
-Vulnerability Subscription Service
-===================================
-
-A horizontally scalable polling service for ingesting vulnerability data from
-multiple third-party APIs (Qualys, Rapid7, Tenable) into an append-only log.
-
-Features:
-    - Generic API registration with configurable polling intervals (minute/hour/day)
-    - Concurrent page fetching with streaming to minimize memory usage
-    - Token bucket rate limiting to respect API quotas
-    - In-memory deduplication with O(1) lookups
-    - Append-only JSON Lines log with atomic writes
-    - Cross-process coordination via file locks for horizontal scaling
-    - Graceful shutdown handling
-
-Usage:
-    python subscription_service.py
-
-    # Or run multiple workers in parallel:
-    python subscription_service.py &
-    python subscription_service.py &
-    python subscription_service.py &
-"""
-
 import asyncio
 import aiohttp
 import json
